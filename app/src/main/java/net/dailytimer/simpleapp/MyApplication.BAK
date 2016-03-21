@@ -1,0 +1,1184 @@
+package net.DailyTimer.imadoco;
+
+import net.DailyTimer.imadoco.R;
+
+import java.io.InputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+
+import org.acra.*;
+import org.acra.annotation.*;
+
+import com.android.vending.billing.Purchase;
+
+import static org.acra.ReportField.*;
+import android.accounts.Account;
+import android.accounts.AccountManager;
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.app.AlarmManager;
+import android.app.Application;
+import android.app.PendingIntent;
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.pm.Signature;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.ConnectivityManager;
+import android.net.Uri;
+import android.os.AsyncTask;
+import android.os.Build;
+import android.os.PowerManager;
+import android.preference.PreferenceManager;
+import android.provider.ContactsContract;
+import android.provider.ContactsContract.CommonDataKinds.Email;
+import android.telephony.TelephonyManager;
+import android.text.format.DateFormat;
+import android.util.Log;
+import android.provider.Settings;
+
+// ACRA V4.8.5
+@ReportsCrashes(
+	formUri = "https://collector.tracepot.com/99652819",
+	sharedPreferencesName = "acra_prefs",
+	sharedPreferencesMode = Context.MODE_PRIVATE)
+
+public class MyApplication extends Application
+{
+	private static final String TAG = "DT.imd.mainActivity";	// MainActivityと同じにします
+
+	private static final int SIGNATURE_UNKNOWN	= 0;
+	private static final int SIGNATURE_INVALID	= 1;
+	private static final int SIGNATURE_VERIFIED	= 2;
+
+	public static final int LOG_FILE_MAX_BYTES		= (32 * 1024);
+
+	private int signatureCheckStatus,verifiedSignatureHash;
+	private String myPackageName;
+	public	static PreferenceStore preferenceStore;
+	private	KeepScreenTask keepScreenTask;
+	private boolean preferenceStoreLoaded;
+	public boolean dataBaseImported;
+	public boolean dataBaseRecovered;
+	public	String debugText = "";
+	public boolean freshInstance;
+	private int savedSignatureHash = 0;
+
+	private static SignatureChecker signatureChecker = null;		// 念のため初期化しておきます
+	private static boolean signatureCheckerResult = true;
+	private static NanoLog logger = null;
+	private static long reportId;
+	private static Context context;
+	private static int locationHistoryDialogListViewIndex = -1;
+	private static int locationHistoryDialogListViewTop;
+
+	public static boolean subscriptionStarted = false;
+	public static String savedPurchase = "";
+	public static String savedSignature = "";
+
+	public static String suspendTimeLeft = null;
+
+	// Object for intrinsic lock
+	public static final Object[] sDataLock = new Object[0];
+
+	private static String myPasscode = "";
+	private static boolean myPasscodeReady = false;
+
+	public static int noSpaceLeftOnDisk = 0;
+	
+	private static class ListViewState
+	{
+		public int	top;
+		public int	offset;
+		public ListViewState()
+		{
+			top = -1;
+			offset = 0;
+		}
+	}
+
+	private static ListViewState locationHistoryDialogListViewState = new ListViewState();
+	private static ListViewState adminDialogListViewState = new ListViewState();
+
+	@Override
+	public void onCreate()
+	{
+		// The following line triggers the initialization of ACRA
+		ACRA.init(this);
+		super.onCreate();
+		signatureCheckStatus = SIGNATURE_UNKNOWN;
+		verifiedSignatureHash = 0;
+		preferenceStore = new PreferenceStore(this);
+		preferenceStoreLoaded = false;
+		keepScreenTask = null;
+		signatureChecker = null;	// ここで初期化するのが正解です
+		myPackageName = getPackageName();
+		dataBaseImported = false;
+		dataBaseRecovered = false;
+		freshInstance = true;
+		if(BuildOption.SUPPORT_TRACE_LOG)
+		{
+			logger = new NanoLog(LOG_FILE_MAX_BYTES);
+		}
+		// V2.07.0から都度インスタンスを作ることにしました
+		SharedPreferences clone = ClonePreferences.get(this);
+		ACRA.getErrorReporter().setEnabled(clone.getBoolean(OptionScreen.ACRA_ENABLED_KEY,true));
+		reportId = clone.getLong(MainActivity.REPORT_ID_KEY,0);
+		context = this;
+	}
+
+	public synchronized void loadPreferenceStore(Context context)
+	{
+		if(preferenceStoreLoaded == false)
+		{
+			// load preference from DB
+			preferenceStore.loadMapFromDB(context);
+			preferenceStoreLoaded = true;
+		}
+	}
+
+	public static void markDatabaseFileUpdated(Context context,boolean important)
+	{
+		SharedPreferences sub = SubPreferences.get(context);
+		SharedPreferences.Editor editor = sub.edit();
+		editor.putBoolean(SubPreferences.DB_EXPORTED_KEY,false);
+		MyApplication.commit(editor);
+	}
+
+	public synchronized void createKeepScreenTask(Activity activity,Context context)
+	{
+		if(keepScreenTask == null)
+		{
+			keepScreenTask = new KeepScreenTask(activity,context);
+			keepScreenTask.execute();
+		}
+	}
+
+	public synchronized void stopKeepScreenTask()
+	{
+		if(keepScreenTask != null)
+		{
+			keepScreenTask.cancel(false);
+			keepScreenTask = null;
+		}
+	}
+
+	public void extendScreenOn()
+	{
+		if(keepScreenTask != null)
+		{
+			keepScreenTask.extendScreenOn();
+		}
+	}
+
+	public class KeepScreenTask extends AsyncTask<Void,Integer,Boolean>
+	{
+		private Activity activity;
+		private Context context;
+		private PowerManager.WakeLock wakeLock;
+		private	long lastTimeExtended;
+
+		public KeepScreenTask(Activity activity,Context context)
+		{
+			this.activity = activity;
+			this.context = context;
+		}
+
+		@Override
+		protected void onPreExecute()
+		{
+			PowerManager pm = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
+			wakeLock = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK,TAG);
+			wakeLock.setReferenceCounted(false);
+			wakeLock.acquire();
+			lastTimeExtended = 0;
+		}
+
+		@Override
+		protected Boolean doInBackground(Void... parms)
+		{
+			Integer dummy = 0;
+			while(true)
+			{
+				publishProgress(dummy);
+				try
+				{
+					Thread.sleep(200);
+				}
+				catch(InterruptedException ie)
+				{
+					break;
+				}
+				if(isCancelled())
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		@Override
+		protected void onProgressUpdate(Integer... progress)
+		{
+			if(lastTimeExtended != 0)
+			{
+				if(System.currentTimeMillis() - lastTimeExtended > 30 * 1000)
+				{
+					if(wakeLock.isHeld())
+					{
+						wakeLock.release();
+					}
+					lastTimeExtended = 0;
+				}
+			}
+		}
+
+		@Override
+		protected void onCancelled()
+		{
+			cleanup();
+		}
+
+		@Override
+		protected void onPostExecute(Boolean result)
+		{
+			cleanup();
+		}
+
+		private void cleanup()
+		{
+			if(wakeLock.isHeld())
+			{
+				wakeLock.release();
+			}
+		}
+
+		public void extendScreenOn()
+		{
+			if(wakeLock.isHeld() == false)
+			{
+				wakeLock.acquire();
+			}
+			lastTimeExtended = System.currentTimeMillis();
+		}
+	}
+
+	public boolean checkSignature(Context context)
+	{
+		if(BuildOption.SIMULATE_REPACKAGED)
+		{
+			return false;
+		}
+		if(BuildOption.DISABLE_SIGNATURE_CHECK)
+		{
+			return true;
+		}
+		if(signatureCheckStatus == SIGNATURE_UNKNOWN)
+		{
+			signatureCheckStatus = SIGNATURE_INVALID;
+			int code = 0;
+			try
+			{
+				code = getSignatureHashCode(context);
+			}
+			catch(IllegalArgumentException e)
+			{
+				return false;
+			}
+			catch(SecurityException e)
+			{
+				return false;
+			}
+			catch(NameNotFoundException e)
+			{
+				return false;
+			}
+
+			if(BuildOption.SHOW_PRIVATE_LOG)
+			{
+				Log.i(TAG,"Signature hashcode=" + code);
+			}
+			if(code == 1507536107)
+			{
+				if(BuildOption.SHOW_PRIVATE_LOG)
+				{
+					Log.i(TAG,"Signature verified");
+				}
+				signatureCheckStatus = SIGNATURE_VERIFIED;
+				verifiedSignatureHash = code;
+			}
+			if(signatureCheckStatus == SIGNATURE_INVALID)
+			{
+				putTraceToAcra("$0363");
+				ACRA.getErrorReporter().handleException(new RuntimeException("Bad exception"));
+			}
+		}
+		return signatureCheckStatus == SIGNATURE_VERIFIED;
+	}
+
+	// ハッキング対策用
+	public boolean verifySignatureCheckCode(int code)
+	{
+		if(BuildOption.DISABLE_SIGNATURE_CHECK)
+		{
+			return true;
+		}
+		else
+		{
+			// V1.31.0からsavedSignatureHashを追加
+			if(signatureCheckStatus == SIGNATURE_VERIFIED && verifiedSignatureHash == code && savedSignatureHash == 1507536107)
+			{
+				return true;
+			}
+			return false;
+		}
+	}
+
+	private int getSignatureHashCode(Context context) throws NameNotFoundException
+	{
+		Signature[] signatures = context.getPackageManager().getPackageInfo(myPackageName,PackageManager.GET_SIGNATURES).signatures;
+		savedSignatureHash = signatures[0].hashCode();
+		return savedSignatureHash;
+	}
+
+	public static boolean checkSignature(Context context,int value1,int value2)
+	{
+		if(BuildOption.DISABLE_SIGNATURE_CHECK || BuildOption.DISABLE_ANTI_LVL_CODE)
+		{
+			return true;
+		}
+		if(signatureChecker == null)
+		{
+			signatureChecker = new SignatureChecker();
+			if(BuildOption.PAID_APP)
+			{
+				signatureCheckerResult = signatureChecker.checkSignature(context,value1,value2,"net.DailyTimer.imadoco");
+			}
+			else
+			{
+				signatureCheckerResult = signatureChecker.checkSignature(context,value1,value2,"net.DailyTimer.imadocoFree");
+			}
+		}
+		return signatureCheckerResult;
+	}
+
+	public static boolean getSignatureCheckResult()
+	{
+		if(signatureChecker != null)
+		{
+			return signatureCheckerResult;
+		}
+		return true;
+	}
+
+	public static String decodeString(String text)
+	{
+		String output = "";
+		for(int i = 0 ; i < text.length() ; i += 2)
+		{
+			String lower = "" + text.charAt(i);
+			String upper = "" + text.charAt(i + 1);
+			int v = (Integer.parseInt(upper,16) << 4) + Integer.parseInt(lower,16);
+			String work = String.format("%c",v);
+			output += work;
+		}
+		return output;
+	}
+
+	public boolean checkTestMode()
+	{
+		// V2.07.0から都度インスタンスを作ることにしました
+		SharedPreferences clone = ClonePreferences.get(context);
+		// V1.28.0で２時間で自動的にオフになる仕様は廃止されました
+		return clone.getBoolean(OptionScreen.TEST_MODE_KEY,true);		// V1.28.0からデフォルトでオンです
+	}
+
+	public boolean checkOperatorIsDocomo(Context context)
+	{
+		boolean result = false;
+		TelephonyManager telephonyManager = (TelephonyManager)context.getSystemService(Context.TELEPHONY_SERVICE);
+		try
+		{
+			if(isMobileDataEnabled() == false)
+			{
+				// モバイルデータ通信がオフならドコモの基地局は使いません
+				return false;
+			}
+			if(telephonyManager.getSimState() == TelephonyManager.SIM_STATE_READY)
+			{
+				String name = telephonyManager.getSimOperatorName();
+				// Log.i(TAG,"operator=" + name);
+				if(name != null)
+				{
+					if(name.toUpperCase(Locale.US).indexOf("DOCOMO") != -1)
+					{
+						result = true;
+					}
+				}
+			}
+		}
+		catch(SecurityException e)
+		{
+			result = false;
+		}
+		if(BuildOption.FORCE_DOCOMO_SIM)
+		{
+			result = true;
+		}
+		if(BuildOption.FORCE_NOT_DOCOMO_SIM)
+		{
+			result = false;
+		}
+		return result;
+	}
+
+	public boolean isMobileDataEnabled()
+	{
+		boolean result = true;
+		try
+		{
+			ConnectivityManager manager = (ConnectivityManager)context.getSystemService(Context.CONNECTIVITY_SERVICE);
+			Method method = ConnectivityManager.class.getDeclaredMethod("getMobileDataEnabled");
+			method.setAccessible(true);
+			result = (Boolean)method.invoke(manager);
+		}
+		catch(Exception e)
+		{
+			// 例外起きてもtrueを返します
+		}
+		return result;
+	}
+
+	public boolean checkSimCardReady(Context context)
+	{
+		boolean result = false;
+		TelephonyManager telephonyManager = (TelephonyManager)context.getSystemService(Context.TELEPHONY_SERVICE);
+		try
+		{
+			if(telephonyManager.getSimState() == TelephonyManager.SIM_STATE_READY)
+			{
+				result = true;
+			}
+		}
+		catch(SecurityException e)
+		{
+			result = false;
+		}
+		if(result == true)
+		{
+			try
+			{
+				// 電話番号を取得します
+				// android.permission.READ_PHONE_STATE パーミッションが必要です
+				if(telephonyManager.getLine1Number() == null)
+				{
+					// 電話番号が取得できないのでSIMカードなしとします
+					result = false;
+				}
+			}
+			catch(Exception e)
+			{
+				result = false;
+			}
+		}
+		if(BuildOption.FORCE_HAVE_SIM)
+		{
+			result = true;
+		}
+		if(BuildOption.FORCE_NO_SIM)
+		{
+			result = false;
+		}
+		return result;
+	}
+
+	public boolean enableMobileNetwork(Context context,boolean on)
+	{
+		try
+		{
+			if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2 || BuildOption.SIMULATE_JELLY_BEAN_MR2 == true)
+			{
+				return false;
+			}
+			else if(Build.VERSION.SDK_INT == Build.VERSION_CODES.FROYO)
+			{
+				Method dataConnSwitchmethod;
+				Class<?> telephonyManagerClass;
+				Object ITelephonyStub;
+				Class<?> ITelephonyClass;
+
+				TelephonyManager telephonyManager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+				telephonyManagerClass = Class.forName(telephonyManager.getClass().getName());
+				Method getITelephonyMethod = telephonyManagerClass.getDeclaredMethod("getITelephony");
+				getITelephonyMethod.setAccessible(true);
+				ITelephonyStub = getITelephonyMethod.invoke(telephonyManager);
+				ITelephonyClass = Class.forName(ITelephonyStub.getClass().getName());
+				if(on)
+				{
+					dataConnSwitchmethod = ITelephonyClass.getDeclaredMethod("enableDataConnectivity");
+				}
+				else
+				{
+					dataConnSwitchmethod = ITelephonyClass.getDeclaredMethod("disableDataConnectivity");
+				}
+				dataConnSwitchmethod.setAccessible(true);
+				dataConnSwitchmethod.invoke(ITelephonyStub);
+			}
+			else
+			{
+				final ConnectivityManager conman = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+				final Class<?> conmanClass = Class.forName(conman.getClass().getName());
+				final Field iConnectivityManagerField = conmanClass.getDeclaredField("mService");
+				iConnectivityManagerField.setAccessible(true);
+				final Object iConnectivityManager = iConnectivityManagerField.get(conman);
+				final Class<?> iConnectivityManagerClass =  Class.forName(iConnectivityManager.getClass().getName());
+				final Method setMobileDataEnabledMethod = iConnectivityManagerClass.getDeclaredMethod("setMobileDataEnabled", Boolean.TYPE);
+				setMobileDataEnabledMethod.setAccessible(true);
+				setMobileDataEnabledMethod.invoke(iConnectivityManager,on);
+			}
+			return true;
+		}
+		catch(Exception e)
+		{
+			putTraceToAcra("failed to enable mobile network");
+			ACRA.getErrorReporter().handleException(e);
+			return false;
+		}
+	}
+
+	public Bitmap getAvatar(Context context,String account)
+	{
+		// account(=address)からアバターを取得します
+		Uri uri = Uri.withAppendedPath(Email.CONTENT_LOOKUP_URI,Uri.encode(account));
+		ContentResolver contentResolver = context.getContentResolver();
+		Cursor cur = contentResolver.query(uri,new String[]{Email.CONTACT_ID,ContactsContract.Data.DISPLAY_NAME,ContactsContract.Data.PHOTO_ID}, null, null, null);
+		if(cur == null)		// ここで死ぬ端末がありました
+		{
+			// V1.25.0で対策しました
+			// V3.01.0からドロイド君を返すようにしました
+			return BitmapFactory.decodeResource(context.getResources(),R.drawable.no_avatar);
+		}
+		final int contactIndex = cur.getColumnIndex(Email.CONTACT_ID);
+		final int photoIndex = cur.getColumnIndex(ContactsContract.Data.PHOTO_ID);
+
+		String	id;
+		int	photoId;
+		if(cur.moveToFirst())
+		{
+			do
+			{
+				id = cur.getString(contactIndex);
+				photoId = cur.getInt(photoIndex);
+				if(photoId != 0)
+				{
+					Uri photo_uri = ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI,Long.parseLong(id));
+					InputStream in = ContactsContract.Contacts.openContactPhotoInputStream(contentResolver,photo_uri);
+					return BitmapFactory.decodeStream(in);
+				}
+			}
+			while(cur.moveToNext());
+		}
+		// V3.01.0からドロイド君を返すようにしました
+		return BitmapFactory.decodeResource(context.getResources(),R.drawable.no_avatar);
+	}
+
+	@SuppressLint("NewApi")
+	public static void commit(SharedPreferences.Editor editor)
+	{
+		if(BuildOption.CHECK_COMMIT_RESULT)
+		{
+			if(editor.commit() == false)
+			{
+				ACRA.getErrorReporter().handleException(new RuntimeException("Commit failed"));
+			}
+		}
+		else
+		{
+			// V2.27.0からapplyをやめました
+			editor.commit();
+			/**
+			if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.GINGERBREAD)
+			{
+				editor.apply();
+			}
+			else
+			{
+				editor.commit();
+			}
+			**/
+		}
+	}
+
+	public static void trace(String text)
+	{
+		if(text == null)
+		{
+			// V2.30.0でnullを渡してくることがありました
+			return;
+		}
+		if(BuildOption.SHOW_PRIVATE_LOG)
+		{
+			Log.i(TAG,text);
+		}
+		if(BuildOption.SUPPORT_TRACE_LOG && logger != null)
+		{
+			String string;
+			string = utc2string(System.currentTimeMillis()) + " ";
+			string += text;
+			logger.put(string);
+		}
+	}
+
+	public static void clearTrace()
+	{
+		if(logger != null)
+		{
+			logger.clear();
+		}
+	}
+
+	public static String exportTrace()
+	{
+		if(logger != null)
+		{
+			return logger.export();
+		}
+		return "";
+	}
+
+	public static String getDebugTrace()
+	{
+		if(logger != null)
+		{
+			return logger.toString();
+		}
+		return "";
+	}
+
+	public static String getSavedDebugTrace()
+	{
+		if(logger != null)
+		{
+			return logger.toStringPrevious();
+		}
+		return "";
+	}
+
+	public static void putTraceToAcra(String text)
+	{
+		ACRA.getErrorReporter().putCustomData("info",text);
+		ACRA.getErrorReporter().putCustomData("id","" + reportId);
+	}
+
+	private static String utc2string(long utc)
+	{
+		//final java.text.DateFormat dateFormat = android.text.format.DateFormat.getDateFormat(context);
+		//final String t = dateFormat.format(utc) + "  " + android.text.format.DateFormat.getTimeFormat(context).format(utc);
+
+		final Date nowDate = new Date();
+		final SimpleDateFormat sdf = new SimpleDateFormat("MM'/'dd' 'HH':'mm':'ss");
+		///final SimpleDateFormat sdf = new SimpleDateFormat("HH':'mm':'ss");
+		String t = sdf.format(nowDate);
+		return t;
+	}
+
+	public static String getHiddenKey(Context context)
+	{
+		String string = context.getString(R.string.mapaider);	// "mapaider"
+		return string.substring(2,6);	// "paid"
+	}
+
+	public static boolean isJapaneseSelected()
+	{
+		if("Japanese".equals(context.getString(R.string.language)))
+		{
+			return true;
+		}
+		// above is the best way for this, below are less reliable
+		// Locale locale = Locale.getDefault();
+		// if(locale.equals(Locale.JAPAN) || locale.equals(Locale.JAPANESE))
+		// {
+		// 	return true;
+		// }
+		// if(locale.toString().startsWith("ja"))
+		// {
+		// 	return true;
+		// }
+		return false;
+	}
+
+	public static boolean containsFormatingCode(String message)
+	{
+		if(message.contains("[[red:") || message.contains("[[blue:"))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static String  formatMessage(String message)
+	{
+		message = message.replace("[[red:","<font color=\"red\">");
+		message = message.replace("[[blue:","<font color=\"blue\">");
+		message = message.replace("]]","</font>");
+		message = message.replace("\n","<br>");
+		return message;
+	}
+
+	public static String hashString(String keyString)
+	{
+		MessageDigest md = null;
+		try
+		{
+			md = MessageDigest.getInstance("MD5");
+		}
+		catch(NoSuchAlgorithmException e)
+		{
+			// ありえない
+			return "";
+		}
+		byte[] dat = keyString.getBytes();
+		md.update(dat);		// dat配列からダイジェストを計算する
+		byte[] digest = md.digest();
+		StringBuffer sb = new StringBuffer();
+		for(int i = 0; i < digest.length; i++)
+		{
+			sb.append(Integer.toHexString((digest[i] >> 4) & 0x0f));	// 上位ニブルを1文字へ
+			sb.append(Integer.toHexString( digest[i] & 0x0f));			// 下位ニブルを1文字へ
+		}
+		return sb.toString();
+	}
+
+	public static String utcToTimeString(Context context,long utc)
+	{
+		final java.text.DateFormat dateFormat = android.text.format.DateFormat.getDateFormat(context);
+		String text = dateFormat.format(utc) + "  " + getTimeFormat(context).format(utc);
+		return text;
+	}
+
+	static String getTimeFormatPattern(Context context)
+	{
+		final String HOURS_24 = "24";
+		final String PATTERN_24 = "H:mm";
+		final String PATTERN_12 = "h:mm a";
+		if(DateFormat.is24HourFormat(context))
+		{
+			return PATTERN_24;
+		}
+		else
+		{
+			return PATTERN_12;
+		}
+		/**
+		String value = Settings.System.getString(context.getContentResolver(),Settings.System.TIME_12_24);
+		if(HOURS_24.equals(value))
+		{
+			return PATTERN_24;
+		}
+		else
+		{
+			return PATTERN_12;
+		}
+		**/
+	}
+
+	static SimpleDateFormat getTimeFormat(Context context)
+	{
+		return new SimpleDateFormat(getTimeFormatPattern(context));
+	}
+
+	public static void clearLocationHistoryDialogListViewState()
+	{
+		locationHistoryDialogListViewState.top = 0;
+		locationHistoryDialogListViewState.offset = 0;
+	}
+
+	public static void saveLocationHistoryDialogListViewState(int top,int offset)
+	{
+		locationHistoryDialogListViewState.top = top;
+		locationHistoryDialogListViewState.offset = offset;
+	}
+
+	public static void restoreLocationHistoryDialogListViewState(HistoryChoiceListView listView)
+	{
+		if(locationHistoryDialogListViewState.top != -1)
+		{
+			listView.getListView().setSelectionFromTop(locationHistoryDialogListViewState.top,locationHistoryDialogListViewState.offset);
+		}
+	}
+
+	public static void saveAdminDialogListViewState(int top,int offset)
+	{
+		adminDialogListViewState.top = top;
+		adminDialogListViewState.offset = offset;
+	}
+
+	public static void restoreAdminDialogListViewState(MemberList listView)
+	{
+		if(adminDialogListViewState.top != -1)
+		{
+			listView.scrollToIndex(adminDialogListViewState.top,adminDialogListViewState.offset);
+		}
+	}
+
+	public static void copySpToClone(Context context)
+	{
+		// cloneを作成します
+		SharedPreferences clone = ClonePreferences.get(context);
+		SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(context);
+		boolean needToUpdate = false;
+		if(sp.getLong(MainActivity.REPORT_ID_KEY,0) != clone.getLong(MainActivity.REPORT_ID_KEY,0))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getString(MainActivity.PASSCODE_KEY,"").equals(clone.getString(MainActivity.PASSCODE_KEY,"")) == false)
+		{
+			needToUpdate = true;
+		}
+		if(sp.getString(OptionScreen.NOTIFICATION_SOUND_KEY,"").equals(clone.getString(OptionScreen.NOTIFICATION_SOUND_KEY,"")) == false)
+		{
+			needToUpdate = true;
+		}
+		if(sp.getString(OptionScreen.ALARM_DURATION_KEY,"").equals(clone.getString(OptionScreen.ALARM_DURATION_KEY,"")) == false)
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.USE_VIBRATOR_KEY,true) != clone.getBoolean(OptionScreen.USE_VIBRATOR_KEY,true))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.USE_DOCOMO_SERVICE_KEY,false) != clone.getBoolean(OptionScreen.USE_DOCOMO_SERVICE_KEY,false))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.TEST_MODE_KEY,true) != clone.getBoolean(OptionScreen.TEST_MODE_KEY,true))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.ACRA_ENABLED_KEY,true) != clone.getBoolean(OptionScreen.ACRA_ENABLED_KEY,true))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.SEND_BACK_SMS_KEY,true) != clone.getBoolean(OptionScreen.SEND_BACK_SMS_KEY,true))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.NOTIFY_LOCATING_KEY,true) != clone.getBoolean(OptionScreen.NOTIFY_LOCATING_KEY,true))
+		{
+			needToUpdate = true;
+		}
+		if(sp.getBoolean(OptionScreen.DETECT_FORCE_STOP_KEY,true) != clone.getBoolean(OptionScreen.DETECT_FORCE_STOP_KEY,true))
+		{
+			needToUpdate = true;
+		}
+		if(needToUpdate)
+		{
+			Log.e(TAG,"updating clone");
+			SharedPreferences.Editor editor = clone.edit();
+			editor.putLong(MainActivity.REPORT_ID_KEY,sp.getLong(MainActivity.REPORT_ID_KEY,0));
+			editor.putString(MainActivity.PASSCODE_KEY,sp.getString(MainActivity.PASSCODE_KEY,""));
+			editor.putString(OptionScreen.NOTIFICATION_SOUND_KEY,sp.getString(OptionScreen.NOTIFICATION_SOUND_KEY,""));
+			editor.putString(OptionScreen.ALARM_DURATION_KEY,sp.getString(OptionScreen.ALARM_DURATION_KEY,""));
+			editor.putBoolean(OptionScreen.USE_VIBRATOR_KEY,sp.getBoolean(OptionScreen.USE_VIBRATOR_KEY,true));
+			editor.putBoolean(OptionScreen.USE_DOCOMO_SERVICE_KEY,sp.getBoolean(OptionScreen.USE_DOCOMO_SERVICE_KEY,false));
+			editor.putBoolean(OptionScreen.TEST_MODE_KEY,sp.getBoolean(OptionScreen.TEST_MODE_KEY,true));
+			editor.putBoolean(OptionScreen.ACRA_ENABLED_KEY,sp.getBoolean(OptionScreen.ACRA_ENABLED_KEY,true));
+			editor.putBoolean(OptionScreen.SEND_BACK_SMS_KEY,sp.getBoolean(OptionScreen.SEND_BACK_SMS_KEY,true));
+			editor.putBoolean(OptionScreen.NOTIFY_LOCATING_KEY,sp.getBoolean(OptionScreen.NOTIFY_LOCATING_KEY,true));
+			editor.putBoolean(OptionScreen.DETECT_FORCE_STOP_KEY,sp.getBoolean(OptionScreen.DETECT_FORCE_STOP_KEY,true));
+			MyApplication.commit(editor);
+
+			//Log.e(TAG,"NOTIFICATION_SOUND_KEY=" + clone.getString(OptionScreen.NOTIFICATION_SOUND_KEY,""));
+			//Log.e(TAG,"ALARM_DURATION_KEY=" + clone.getString(OptionScreen.ALARM_DURATION_KEY,""));
+		}
+	}
+
+	public static void setPurchaseData(Purchase purchase)
+	{
+		if(purchase != null)
+		{
+			savedPurchase = purchase.getOriginalJson();
+			savedSignature = purchase.getSignature();
+		}
+	}
+
+	public static void setUpgraded(boolean upgraded)
+	{
+		SharedPreferences key = KeyPreferences.get(context);
+		SharedPreferences.Editor editor = key.edit();
+		editor.putBoolean(KeyPreferences.UPGRADED_KEY,upgraded);
+		MyApplication.commit(editor);
+	}
+
+	public static boolean isUpgraded()
+	{
+		SharedPreferences key = KeyPreferences.get(context);
+		return key.getBoolean(KeyPreferences.UPGRADED_KEY,false);
+	}
+
+	public static void updatePasscode(Context context)
+	{
+		SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(context);
+		String encodedPasscode = sp.getString(MainActivity.PASSCODE_KEY,"");
+		String passcode = "";
+		if(BuildOption.SIMULATE_PASSCODE_CORRUPTED)
+		{
+			encodedPasscode += "aho";
+		}
+		if(encodedPasscode.equals("") == false)
+		{
+			passcode = decodePasscode(context,encodedPasscode);
+		}
+		if(passcode.equals("") == false)
+		{
+			sendTraceLog(context,"暗証番号は更新済みです");
+			myPasscode = passcode;
+			myPasscodeReady = true;
+			return;
+		}
+		else
+		{
+			sendTraceLog(context,"暗証番号は更新が必要です");
+			// ここでいったんPASSCODE_KEYを初期化します
+			SharedPreferences.Editor editor = sp.edit();
+			editor.putString(MainActivity.PASSCODE_KEY,"");
+			MyApplication.commit(editor);
+		}
+		String obfuscatedPasscode = sp.getString(MainActivity.OLD_PASSCODE_KEY,"");
+		if(obfuscatedPasscode.equals(""))
+		{
+			sendTraceLog(context,"暗証番号は再入力が必要です");
+			return;
+		}
+		Obfuscator obfuscator1 = new Obfuscator(context,0);		// 新形式
+		String unobfuscatedPasscode = "";
+		try
+		{
+			unobfuscatedPasscode = obfuscator1.unobfuscateString(obfuscatedPasscode);
+		}
+		catch(Exception e1)
+		{
+			Obfuscator obfuscator2 = new Obfuscator(context);		// 旧形式
+			try
+			{
+				unobfuscatedPasscode = obfuscator2.unobfuscateString(obfuscatedPasscode);
+			}
+			catch(Exception e2)
+			{
+				ACRA.getErrorReporter().handleException(new RuntimeException("failed unobfuscating passcode"));
+				unobfuscatedPasscode = "";
+			}
+		}
+		if(unobfuscatedPasscode.length() < 4 || unobfuscatedPasscode.length() > 8)
+		{
+			unobfuscatedPasscode = "";
+		}
+		if(unobfuscatedPasscode.equals("") == true)
+		{
+			sendTraceLog(context,"暗証番号は再入力が必要です");
+		}
+		else
+		{
+			sendTraceLog(context,"暗証番号を更新しました");
+		}
+		myPasscode = unobfuscatedPasscode;
+		myPasscodeReady = true;
+		encodedPasscode = encodePasscode(unobfuscatedPasscode);
+		SharedPreferences.Editor editor = sp.edit();
+		editor.putString(MainActivity.PASSCODE_KEY,encodedPasscode);
+		MyApplication.commit(editor);
+		// preferenceStoreにも保存
+		MyApplication.preferenceStore.putString(MainActivity.PASSCODE_KEY,encodedPasscode);
+		// DBを更新
+		MyApplication.preferenceStore.saveMapToDB(context);
+		// DBを更新したのでexportが必要です
+		MyApplication.markDatabaseFileUpdated(context,true);
+		// cloneを更新します
+		MyApplication.copySpToClone(context);
+
+		SharedPreferences sub = SubPreferences.get(context);
+		SharedPreferences.Editor editor1 = sub.edit();
+		editor1.putBoolean(SubPreferences.PASSCODE_READY_KEY,true);
+		MyApplication.commit(editor1);
+	}
+
+	public static String encodePasscode(String passcode)
+	{
+		byte[] modifiedPasscode = passcode.getBytes();
+		String encodedPasscode;
+		for(int i = 0 ; i < modifiedPasscode.length ; i++)
+		{
+			modifiedPasscode[i] = (byte)(modifiedPasscode[i] - '0' + '&');
+		}
+		encodedPasscode = new String(Base64UrlSafe.encodeBase64(modifiedPasscode));
+		return encodedPasscode;
+	}
+
+	public static String decodePasscode(Context context,String encodedPasscode)
+	{
+		String passcode = "";
+		if(encodedPasscode.equals("") == false)
+		{
+			try
+			{
+				passcode = new String(Base64UrlSafe.decodeBase64(encodedPasscode.getBytes()));
+				byte[] array = passcode.getBytes();
+				for(int i = 0 ; i < array.length ; i++)
+				{
+					array[i]  = (byte)(array[i] - '&' + '0');
+				}
+				passcode = new String(array,"UTF-8");
+				if(passcode.length() < 4 || passcode.length() > 8)
+				{
+					ACRA.getErrorReporter().handleException(new RuntimeException("passcode corrupted"));
+					passcode = "";
+				}
+			}
+			catch(Exception e)
+			{
+				ACRA.getErrorReporter().handleException(new RuntimeException("failed decoding passcode"));
+				passcode = "";
+			}
+		}
+		return passcode;
+	}
+
+	public static String getPasscode(Context context)
+	{
+		if(myPasscodeReady)
+		{
+			return myPasscode;
+		}
+		updatePasscode(context);
+		myPasscodeReady = true;
+		return myPasscode;
+	}
+
+	public static void setPasscode(String passcode)
+	{
+		myPasscode = passcode;
+		myPasscodeReady = true;
+	}
+	
+	public static void setAlarmClock(AlarmManager alarmManager,long alarm_utc,PendingIntent pendingIntent,Context globalContext)
+	{
+		if(Build.VERSION.SDK_INT >= 23)
+		{
+			Intent intentAlertScreen = new Intent(globalContext,AlertScreen.class);
+			intentAlertScreen.setData(Uri.parse("alarmed"));
+			PendingIntent openIntent = PendingIntent.getActivity(globalContext,3,intentAlertScreen,PendingIntent.FLAG_CANCEL_CURRENT);
+			alarmManager.setAlarmClock(new AlarmManager.AlarmClockInfo(alarm_utc,openIntent),pendingIntent);
+		}
+		else if (Build.VERSION.SDK_INT >= 19)
+		{
+			alarmManager.setExact(AlarmManager.RTC_WAKEUP,alarm_utc,pendingIntent);
+		}
+		else
+		{
+			alarmManager.set(AlarmManager.RTC_WAKEUP,alarm_utc,pendingIntent);
+		}
+	}
+
+	private static void sendTraceLog(Context context,String message)
+	{
+		if(BuildOption.SUPPORT_TRACE_LOG == true)
+		{
+			MyApplication.trace(message);
+			if(BuildOption.SUPPORT_DEBUG_WINDOW)
+			{
+				Intent app_intent = new Intent(DebugScreen.SERVICE_LOG_INTENT);
+				context.sendBroadcast(app_intent);
+			}
+		}
+	}
+
+	/**
+	public static void setSyncable()
+	{
+		if(Build.VERSION.SDK_INT <= 10)
+		{
+			SharedPreferences key = KeyPreferences.get(context);
+			String accountName = key.getString(KeyPreferences.ACCOUNT_NAME_KEY,"x");
+			try
+			{
+				ContentResolver.setMasterSyncAutomatically(true);
+				Account[] accounts = AccountManager.get(context).getAccounts();
+				Account myAccount = null;
+				for(Account account : accounts)
+				{
+					if(account.type.equals("com.google"))
+					{
+						if(account.name != null && account.name.equals(accountName))
+						{
+							myAccount = account;
+							break;
+						}
+					}
+				}
+				if(myAccount != null)
+				{
+					ContentResolver.setIsSyncable(myAccount,ContactsContract.AUTHORITY,1);
+				}
+			}
+			catch(Exception e)
+			{
+				ACRA.getErrorReporter().handleException(e);
+			}
+		}
+	}
+	**/
+}
+
+	/**
+
+		String getPM = new String(Base64.decode("Z2V0UGFja2FnZU1hbmFnZXI=\n",0));
+		String getPI = new String(Base64.decode("Z2V0UGFja2FnZUluZm8=\n",0));
+
+	Signature[] signatures;
+	try
+	{
+		signatures = context.getPackageManager().getPackageInfo(context.getPackageName(),PackageManager.GET_SIGNATURES).signatures;
+	}
+	catch(NameNotFoundException e)
+	{
+		ACRA.getErrorReporter().handleException(e);
+		return false;
+	}
+	for(Signature sig : signatures)
+	{
+		if(BuildOption.SHOW_PRIVATE_LOG)
+		{
+			Log.i(TAG,"Signature hashcode=" + sig.hashCode());
+		}
+		int x = sig.hashCode();
+		if(x == 1507536107)
+		{
+			signatureCheckStatus = SIGNATURE_VERIFIED;
+			verifiedSignatureHash = x;
+			break;
+		}
+	}
+	**/
+
+		/***
+		for(int i = 0 ; i < 400 ; i++)
+		{
+			traceBuffer.put("hohoho"+ i + "aaaaa");
+		}
+		Log.i(TAG,traceBuffer.toString(20));
+		***/
+
+//11-01 09:58:05.275: INFO/DT.imd.mainActivity(4167): Signature hashcode=1507536107
